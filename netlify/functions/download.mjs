@@ -1,18 +1,11 @@
 const ALLOWED_HOSTS = [
-  'terabox.app',
-  'teraboxshare.com',
-  'terabox.com',
-  '1024terabox.com',
-  'teraboxlink.com',
-  'terasharefile.com',
-  'terafileshare.com',
-  'terasharelink.com',
-  '1024tera.com',
-  'freeterabox.com',
-  'teraboxurl.com'
+  'terabox.app','teraboxshare.com','terabox.com','1024terabox.com','teraboxlink.com',
+  'terasharefile.com','terafileshare.com','terasharelink.com','1024tera.com',
+  'freeterabox.com','teraboxurl.com','teraboxapp.com','terabox.fun'
 ];
 
-const DEFAULT_PROXY = 'https://tbx-proxy.shakir-ansarii075.workers.dev';
+const DEFAULT_GATEWAY = 'https://tera-core.vercel.app/api';
+const DEFAULT_WORKER = 'https://tbx-proxy.shakir-ansarii075.workers.dev';
 
 function isAllowedTeraBoxUrl(value) {
   try {
@@ -20,213 +13,179 @@ function isAllowedTeraBoxUrl(value) {
     if (u.protocol !== 'https:') return false;
     const host = u.hostname.toLowerCase();
     return ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 function extractSurl(value) {
   const u = new URL(value);
   let surl = u.searchParams.get('surl') || '';
-  if (!surl && u.pathname.includes('/s/')) {
-    surl = u.pathname.split('/s/')[1]?.split('/')[0] || '';
-  }
+  if (!surl && u.pathname.includes('/s/')) surl = u.pathname.split('/s/')[1]?.split('/')[0] || '';
   surl = decodeURIComponent(surl).trim();
-  // TeraBox share links often prefix the short id with "1".
-  if (surl.startsWith('1') && surl.length > 1) surl = surl.slice(1);
   return surl;
+}
+
+function rawSurl(value) {
+  const s = extractSurl(value);
+  return s.startsWith('1') && s.length > 1 ? s.slice(1) : s;
+}
+
+function canonicalShareUrl(value) {
+  const s = extractSurl(value);
+  const withPrefix = s.startsWith('1') ? s : `1${s}`;
+  return `https://1024terabox.com/s/${withPrefix}`;
 }
 
 function formatBytes(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return '';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let size = n;
-  let i = 0;
-  while (size >= 1024 && i < units.length - 1) {
-    size /= 1024;
-    i += 1;
-  }
+  const units = ['B','KB','MB','GB','TB'];
+  let size = n, i = 0;
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i += 1; }
   return `${size >= 10 || i === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[i]}`;
 }
 
 function pickThumb(file = {}) {
-  const thumbs = file.thumbs || file.thumbnail || file.thumb || {};
-  if (typeof thumbs === 'string') return thumbs;
-  return thumbs.url3 || thumbs.url2 || thumbs.url1 || thumbs.icon || '';
+  const t = file.thumbnails || file.thumbs || file.thumbnail || file.thumb || {};
+  if (typeof t === 'string') return t;
+  return t.original || t.url3 || t.url2 || t.url1 || t.icon || '';
 }
 
 function normalizeFile(file = {}, fallback = {}) {
-  const sizeBytes = Number(file.size ?? file.file_size ?? fallback.size ?? 0);
-  const dlink =
-    file.dlink ||
-    file.download_link ||
-    file.direct_link ||
-    file.download_url ||
-    fallback.dlink ||
-    '';
-
+  const sizeBytes = Number(file.size_bytes ?? file.size ?? file.file_size ?? fallback.size ?? 0);
+  const dlink = file.direct_link || file.download_link || file.dlink || file.download_url || file.link || fallback.dlink || '';
   return {
-    file_name:
-      file.server_filename ||
-      file.filename ||
-      file.name ||
-      fallback.name ||
-      'TeraBox file',
-    file_size: file.size_text || formatBytes(sizeBytes),
+    file_name: file.server_filename || file.filename || file.file_name || file.name || fallback.name || 'TeraBox file',
+    file_size: typeof file.size === 'string' && /[A-Za-z]/.test(file.size) ? file.size : (file.size_text || formatBytes(sizeBytes)),
     size_bytes: Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : null,
     thumbnail: pickThumb(file) || pickThumb(fallback),
     download_link: typeof dlink === 'string' ? dlink : '',
-    fs_id: String(file.fs_id || file.fid || fallback.fid || ''),
+    fs_id: String(file.fs_id || file.fid || fallback.fid || '')
   };
 }
 
 function filesFromPayload(payload = {}) {
-  const root = payload?.data ?? payload?.upstream ?? payload;
-  const candidates = [];
-
-  if (Array.isArray(root)) candidates.push(...root);
-  if (Array.isArray(root?.list)) candidates.push(...root.list);
-  if (Array.isArray(root?.files)) candidates.push(...root.files);
-
-  // Simplified proxy response for a single file.
-  if (!candidates.length && root && typeof root === 'object') {
-    const looksLikeFile = root.dlink || root.name || root.server_filename || root.fid || root.fs_id;
-    if (looksLikeFile) candidates.push(root);
-  }
-
-  return candidates.map((f) => normalizeFile(f, root));
-}
-
-async function callProxy(proxyBase, params, ndus, signal) {
-  const url = new URL(proxyBase.replace(/\/$/, '') + '/');
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== '') {
-      url.searchParams.set(key, String(value));
+  const roots = [payload, payload?.data, payload?.upstream].filter(Boolean);
+  const found = [];
+  for (const root of roots) {
+    if (Array.isArray(root)) found.push(...root);
+    if (Array.isArray(root?.files)) found.push(...root.files);
+    if (Array.isArray(root?.list)) found.push(...root.list);
+    if (!Array.isArray(root) && root && typeof root === 'object') {
+      if (root.dlink || root.direct_link || root.download_link || root.server_filename || root.filename) found.push(root);
     }
   }
+  const seen = new Set();
+  return found.map((f) => normalizeFile(f, payload)).filter((f) => {
+    const key = `${f.fs_id}|${f.file_name}|${f.download_link}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
-  const headers = {
-    Accept: 'application/json',
-    'User-Agent': 'TeraPocket/3.0 (+Netlify)'
-  };
-  if (ndus) headers.Cookie = `ndus=${ndus}`;
+function errorFrom(data, fallback) {
+  if (!data) return fallback;
+  return data.error || data.message || data.errmsg || data?.details?.errmsg || fallback;
+}
 
+async function fetchJson(url, ndus, signal) {
   const response = await fetch(url, {
     method: 'GET',
-    headers,
+    headers: {
+      Accept: 'application/json',
+      Cookie: `ndus=${ndus}`,
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1 TeraPocket/4.0'
+    },
     signal,
     redirect: 'follow'
   });
-
   const text = await response.text();
   let data = null;
   try { data = JSON.parse(text); } catch {}
-
   return { response, data, text };
 }
 
+async function tryHostedGateway(base, shareUrl, ndus, signal) {
+  const u = new URL(base);
+  u.searchParams.set('url', shareUrl);
+  u.searchParams.set('resolve', 'true');
+  const out = await fetchJson(u, ndus, signal);
+  if (!out.response.ok) return { ok:false, error:errorFrom(out.data, `Gateway HTTP ${out.response.status}`) };
+  if (!out.data) return { ok:false, error:'Gateway returned a non-JSON response.' };
+  if (out.data.error || out.data.status === 'error') return { ok:false, error:errorFrom(out.data, 'Gateway error') };
+  const files = filesFromPayload(out.data).filter(f => /^https:\/\//i.test(f.download_link));
+  return files.length ? { ok:true, files, source:'hosted-gateway' } : { ok:false, error:'Gateway returned no direct download link.' };
+}
+
+async function tryWorker(base, surl, ndus, signal) {
+  const u = new URL(base.replace(/\/$/, '') + '/');
+  u.searchParams.set('mode', 'resolve');
+  u.searchParams.set('surl', surl);
+  u.searchParams.set('raw', '1');
+  u.searchParams.set('refresh', '1');
+  const out = await fetchJson(u, ndus, signal);
+  if (!out.response.ok) return { ok:false, error:errorFrom(out.data, `Worker HTTP ${out.response.status}`) };
+  if (!out.data) return { ok:false, error:'Worker returned a non-JSON response.' };
+  if (out.data.error) return { ok:false, error:errorFrom(out.data, 'Worker error') };
+  const files = filesFromPayload(out.data).filter(f => /^https:\/\//i.test(f.download_link));
+  return files.length ? { ok:true, files, source:'worker' } : { ok:false, error:'Worker returned no direct download link.' };
+}
+
 export default async (req) => {
-  if (req.method !== 'POST') {
-    return Response.json({ error: 'Method not allowed' }, { status: 405 });
-  }
+  if (req.method !== 'POST') return Response.json({ error:'Method not allowed' }, { status:405 });
 
   let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 });
-  }
+  try { body = await req.json(); }
+  catch { return Response.json({ error:'Invalid JSON' }, { status:400 }); }
 
   const link = String(body?.link || '').trim();
-  if (!isAllowedTeraBoxUrl(link)) {
-    return Response.json(
-      { error: 'Please use a supported HTTPS TeraBox share link.' },
-      { status: 400 }
-    );
-  }
+  if (!isAllowedTeraBoxUrl(link)) return Response.json({ error:'Please use a supported HTTPS TeraBox share link.' }, { status:400 });
 
-  const surl = extractSurl(link);
-  if (!surl) {
-    return Response.json({ error: 'Could not read the TeraBox share ID from this link.' }, { status: 400 });
-  }
+  const surl = rawSurl(link);
+  if (!surl) return Response.json({ error:'Could not read the TeraBox share ID from this link.' }, { status:400 });
 
-  const proxyBase = (Netlify.env.get('TERABOX_PROXY_BASE') || DEFAULT_PROXY).trim();
   const ndus = (Netlify.env.get('TERABOX_NDUS') || '').trim();
+  if (!ndus) {
+    return Response.json({
+      error:'TeraPocket v4 needs TERABOX_NDUS in Netlify Environment variables. Add your own TeraBox ndus session value, then redeploy.',
+      needs_ndus:true
+    }, { status:503 });
+  }
 
+  const gateway = (Netlify.env.get('TERABOX_GATEWAY_BASE') || DEFAULT_GATEWAY).trim();
+  const worker = (Netlify.env.get('TERABOX_WORKER_BASE') || DEFAULT_WORKER).trim();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 22000);
+  const timer = setTimeout(() => controller.abort(), 26000);
+  const attempts = [];
 
   try {
-    // 1) Recommended fast resolve mode.
-    let { response, data } = await callProxy(
-      proxyBase,
-      { mode: 'resolve', surl },
-      ndus,
-      controller.signal
-    );
+    // 1) Maintained hosted gateway with the exact user link.
+    try {
+      const r = await tryHostedGateway(gateway, link, ndus, controller.signal);
+      if (r.ok) return Response.json({ success:true, files:r.files, file_count:r.files.length, source:r.source, authenticated:true }, { headers:{'Cache-Control':'no-store'} });
+      attempts.push(`gateway(original): ${r.error}`);
+    } catch (e) { attempts.push(`gateway(original): ${e?.message || 'request failed'}`); }
 
-    // 2) If the simplified response fails, retry once with raw upstream data.
-    if (!response.ok || data?.error) {
-      const retry = await callProxy(
-        proxyBase,
-        { mode: 'resolve', surl, raw: 1, refresh: 1 },
-        ndus,
-        controller.signal
-      );
-      response = retry.response;
-      data = retry.data;
-    }
+    // 2) Retry hosted gateway with a canonical 1024terabox.com share URL.
+    try {
+      const r = await tryHostedGateway(gateway, canonicalShareUrl(link), ndus, controller.signal);
+      if (r.ok) return Response.json({ success:true, files:r.files, file_count:r.files.length, source:r.source + '-canonical', authenticated:true }, { headers:{'Cache-Control':'no-store'} });
+      attempts.push(`gateway(canonical): ${r.error}`);
+    } catch (e) { attempts.push(`gateway(canonical): ${e?.message || 'request failed'}`); }
 
-    if (!response.ok || !data) {
-      const detail = data?.error || data?.message || `Gateway error (${response.status})`;
-      return Response.json({ error: detail }, { status: 502 });
-    }
+    // 3) Last fallback: current unified worker, with the same authenticated cookie.
+    try {
+      const r = await tryWorker(worker, surl, ndus, controller.signal);
+      if (r.ok) return Response.json({ success:true, files:r.files, file_count:r.files.length, source:r.source, authenticated:true }, { headers:{'Cache-Control':'no-store'} });
+      attempts.push(`worker: ${r.error}`);
+    } catch (e) { attempts.push(`worker: ${e?.message || 'request failed'}`); }
 
-    if (data?.error) {
-      return Response.json({ error: data.error, code: data.code || '' }, { status: 502 });
-    }
-
-    const files = filesFromPayload(data);
-    const downloadable = files.filter((file) => /^https:\/\//i.test(file.download_link));
-
-    if (!downloadable.length) {
-      const hasMetadata = files.length > 0;
-      const message = !ndus && hasMetadata
-        ? 'File info was found, but no working download link was returned. Add TERABOX_NDUS in Netlify Environment variables for authenticated TeraBox downloads.'
-        : 'The gateway found no downloadable file for this share.';
-      return Response.json(
-        {
-          error: message,
-          needs_ndus: !ndus,
-          metadata_found: hasMetadata,
-          source: data?.source || 'gateway'
-        },
-        { status: 502 }
-      );
-    }
-
-    return Response.json(
-      {
-        success: true,
-        files: downloadable,
-        file_count: downloadable.length,
-        source: data?.source || 'gateway',
-        authenticated: Boolean(ndus)
-      },
-      {
-        headers: {
-          'Cache-Control': 'no-store',
-          'Content-Type': 'application/json; charset=utf-8'
-        }
-      }
-    );
+    return Response.json({
+      error:'TeraBox could not resolve this share with the authenticated session. The NDUS may be expired, the share may need verification, or TeraBox may be blocking the current resolver.',
+      details: attempts.slice(0,3)
+    }, { status:502 });
   } catch (err) {
-    const message = err?.name === 'AbortError'
-      ? 'TeraBox gateway timed out. Please try again.'
-      : 'TeraBox gateway is unreachable right now.';
-    return Response.json({ error: message }, { status: 502 });
-  } finally {
-    clearTimeout(timer);
-  }
+    const msg = err?.name === 'AbortError' ? 'TeraBox resolver timed out.' : 'TeraBox resolver is unreachable right now.';
+    return Response.json({ error:msg, details:attempts.slice(0,3) }, { status:502 });
+  } finally { clearTimeout(timer); }
 };
